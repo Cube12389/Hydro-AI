@@ -1,8 +1,0 @@
-{
-  "name": "ai-answer",
-  "version": "2.0.0",
-  "description": "Hydro AI 自动答疑插件（多节点负载分配 / 提示词注入 / 赛时纪律）",
-  "main": "index.js",
-  "license": "MIT",
-  "dependencies": {}
-}
