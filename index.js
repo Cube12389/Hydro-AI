@@ -43,12 +43,13 @@ const DEFAULTS = {
         keywords: [],
         ignoreOwners: [],
     },
-    polling: { enabled: true, intervalMs: 15000, batch: 30, backfill: false },
+    polling: { enabled: true, intervalMs: 15000, batch: 30, backfill: false, backfillWindowMinutes: 120 },
     limits: {
         maxAttempts: 2,
         globalConcurrency: 2,
         perUserPerHour: 0,
         maxInputChars: 9000,
+        queueWaitMs: 600000,
         timeoutMs: 300000,
         maxTokens: 1600,
         temperature: 0.3,
@@ -227,23 +228,35 @@ function syncNodes(cfg) {
         const def = normalizeNode(raw, idx);
         seen.add(def.name);
         const old = runtimeNodes.get(def.name);
-        runtimeNodes.set(def.name, {
-            def,
-            inflight: old ? old.inflight : 0,
-            unhealthyUntil: old ? old.unhealthyUntil : 0,
-            lastError: old ? old.lastError : '',
-            lastUsedAt: old ? old.lastUsedAt : 0,
-            ok: old ? old.ok : 0,
-            fail: old ? old.fail : 0,
-            latencyMs: old ? old.latencyMs : 0,
-        });
+        if (old) {
+            // 关键：必须原地更新，保持对象引用不变。
+            // 若重建对象，正在执行中的任务持有的引用与 map 中的新对象不一致，
+            // inflight 的 +1/-1 会作用到旧对象，新对象的 inflight 永久冻结，
+            // 导致节点被误判为永远繁忙。
+            old.def = def;
+        } else {
+            runtimeNodes.set(def.name, {
+                def,
+                inflight: 0,
+                unhealthyUntil: 0,
+                lastError: '',
+                lastUsedAt: 0,
+                ok: 0,
+                fail: 0,
+                latencyMs: 0,
+            });
+        }
     });
     for (const name of [...runtimeNodes.keys()]) {
-        if (!seen.has(name)) runtimeNodes.delete(name);
+        if (!seen.has(name)) {
+            const rt = runtimeNodes.get(name);
+            // 仅在没有在途任务时移除，避免打断进行中的调用
+            if (!rt || rt.inflight <= 0) runtimeNodes.delete(name);
+        }
     }
 }
 
-function selectNode(capability, tried) {
+function selectNode(capability, tried, { allowBusy = false } = {}) {
     const cfg = cfgRef;
     const now = Date.now();
     const cands = [];
@@ -253,8 +266,8 @@ function selectNode(capability, tried) {
         if (rt.unhealthyUntil > now) continue;
         const model = rt.def.models[capability];
         if (!model) continue;
-        if (rt.inflight >= rt.def.maxConcurrency) continue;
-        cands.push({ rt, model, capability });
+        if (!allowBusy && rt.inflight >= rt.def.maxConcurrency) continue;
+        cands.push({ rt, model, capability, busy: rt.inflight >= rt.def.maxConcurrency });
     }
 
     if (!cands.length) {
@@ -322,14 +335,43 @@ async function chatOnce(nodeDef, model, messages, cfg) {
  * 按能力调用模型，失败自动换节点重试。
  * buildMessages(nodeDef) 允许按节点追加专属提示词。
  */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 等待某个节点出现空位；返回 true 表示可以再试。
+ * 单节点同时承担 normal+coder 时，一次调用会占用数十秒，
+ * 新任务必须排队而不是被判为「没有可用节点」。
+ */
+async function waitForCapacity(capability, deadline) {
+    while (Date.now() < deadline) {
+        const pick = selectNode(capability, null, { allowBusy: true });
+        if (!pick) return false; // 该能力压根没有节点
+        if (!pick.busy) return true;
+        await sleep(1500);
+    }
+    return false;
+}
+
 async function callModel(capability, buildMessages) {
     const cfg = cfgRef;
     const tried = new Set();
     const maxTries = Math.max(1, Number(cfg.routing.retryPerTask) || 1);
+    const deadline = Date.now() + (Number(cfg.limits.queueWaitMs) || 600000);
     let lastErr = null;
 
     for (let i = 0; i < maxTries; i += 1) {
-        const pick = selectNode(capability, tried);
+        let pick = selectNode(capability, tried);
+        if (!pick) {
+            // 节点存在但都在忙 → 排队等待，而非直接失败
+            const hasCapability = !!selectNode(capability, null, { allowBusy: true });
+            if (hasCapability && Date.now() < deadline) {
+                log(`${capability} 节点繁忙，排队等待…`);
+                const ok = await waitForCapacity(capability, deadline);
+                if (ok) {
+                    pick = selectNode(capability, tried);
+                }
+            }
+        }
         if (!pick) break;
         tried.add(pick.rt.def.name);
         const release = await gateAcquire(cfg.limits.globalConcurrency);
@@ -769,7 +811,13 @@ async function pollOnce() {
             if (Number(ddoc.owner) === Number(bot._id)) continue;
             if (!cfg.polling.backfill) {
                 const createdAt = ddoc._id && ddoc._id.getTimestamp ? ddoc._id.getTimestamp().getTime() : 0;
-                if (createdAt && createdAt < runtime.startedAt - 5000) {
+                // 回补窗口：插件重启后，窗口内创建但尚未回复的帖子仍会补答，
+                // 避免重启瞬间的提问被永久跳过；窗口外的旧帖直接忽略。
+                const windowMs = (Number(cfg.polling.backfillWindowMinutes) || 0) * 60000;
+                const floor = windowMs > 0
+                    ? runtime.startedAt - windowMs
+                    : runtime.startedAt - 5000;
+                if (createdAt && createdAt < floor) {
                     answered.add(key);
                     continue;
                 }

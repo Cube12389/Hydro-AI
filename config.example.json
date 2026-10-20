@@ -31,7 +31,8 @@
     "enabled": true,
     "intervalMs": 15000,
     "batch": 30,
-    "backfill": false
+    "backfill": false,
+    "backfillWindowMinutes": 120
   },
 
   "limits": {
@@ -39,6 +40,7 @@
     "globalConcurrency": 2,
     "perUserPerHour": 0,
     "maxInputChars": 9000,
+    "queueWaitMs": 600000,
     "timeoutMs": 300000,
     "maxTokens": 1600,
     "temperature": 0.3
@@ -69,7 +71,7 @@
   },
 
   "prompts": {
-    "extraSystem": "",
+    "extraSystem": "请使用原生 C++14 写代码。",
     "general": "",
     "contest": "",
     "problemAfter": ""
